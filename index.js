@@ -12,9 +12,8 @@ const chatId = process.env.TELEGRAM_CHAT_ID; // ""
 
 // Темы (message_thread_id)
 const TOPICS = {
-  "1m": 150,
   "5m": 152,
-  "15m": 154,
+  "15m": 525,
 };
 
 // ---------- helpers ----------

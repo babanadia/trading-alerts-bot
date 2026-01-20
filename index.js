@@ -14,6 +14,7 @@ const chatId = process.env.TELEGRAM_CHAT_ID; // ""
 const TOPICS = {
   "5m": 152,
   "15m": 525,
+  "rsi4h": 538,
 };
 
 // ---------- helpers ----------

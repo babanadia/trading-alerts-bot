@@ -17,6 +17,7 @@ const TOPICS = {
   "rsi4h": 538,
   "risk": 625,
   "fibo": 658,
+  "btcvol": 684,
 };
 
 // ---------- helpers ----------

@@ -440,6 +440,17 @@ app.post("/webhook/:tf", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
+//test
+app.get("/news/test", (req, res) => {
+  enqueue({
+    threadId: TOPICS.news, // 703
+    message: "🧪 TEST: бот пишет в топик NEWS",
+  });
+  res.send("OK");
+});
+//test
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startNewsScheduler(); // запуск GDELT-новостей

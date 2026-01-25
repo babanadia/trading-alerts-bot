@@ -3,11 +3,15 @@ const TelegramBot = require("node-telegram-bot-api");
 const fs = require("fs");
 const path = require("path");
 
+// Для извлечения текста статьи:
+const { Readability } = require("@mozilla/readability");
+const { JSDOM } = require("jsdom");
+
 const app = express();
 
 // Принимаем всё как текст (TradingView часто шлёт plain text), JSON тоже поддержим
-app.use(express.text({ type: "*/*", limit: "1mb" }));
-app.use(express.json({ limit: "1mb" }));
+app.use(express.text({ type: "*/*", limit: "2mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
 const chatId = process.env.TELEGRAM_CHAT_ID; // "-100...."
@@ -49,24 +53,33 @@ function escapeHtml(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
-
 function escapeAttr(str) {
-  // для href и подобных атрибутов
-  return escapeHtml(String(str || "")).replace(/"/g, "&quot;");
+  // для href=""
+  return String(str || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function truncateText(s, max) {
+  s = String(s || "");
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1).trim() + "…";
 }
 
 // ---------- Telegram send queue (важно для 429) ----------
 const queue = [];
 let processing = false;
 
-// безопасная скорость: ~1 сообщение/сек в один чат (уменьшает 429)
+// безопасная скорость: ~1 сообщение/сек в один чат
 const MIN_DELAY_MS = Number(process.env.TG_MIN_DELAY_MS || 1100);
 
 async function sendWithRetry(job, attempt = 1) {
-  const { threadId, message, parseMode } = job;
+  const { threadId, message, parseMode, disablePreview } = job;
 
   const options = { parse_mode: parseMode || "Markdown" };
-  if (job.disablePreview) options.disable_web_page_preview = true;
+  if (disablePreview) options.disable_web_page_preview = true;
   if (threadId) options.message_thread_id = threadId;
 
   try {
@@ -75,7 +88,6 @@ async function sendWithRetry(job, attempt = 1) {
     const code = err?.response?.body?.error_code;
     const params = err?.response?.body?.parameters;
 
-    // 429: Telegram просит подождать retry_after секунд
     if (code === 429 && params?.retry_after && attempt <= 5) {
       const waitMs = params.retry_after * 1000 + 250;
       console.warn(`TG 429. retry_after=${params.retry_after}s. attempt=${attempt}`);
@@ -83,7 +95,6 @@ async function sendWithRetry(job, attempt = 1) {
       return sendWithRetry(job, attempt + 1);
     }
 
-    // сетевые/временные ошибки — повторим пару раз
     const msg = String(err?.message || err);
     const isTransient =
       msg.includes("ETIMEDOUT") ||
@@ -120,113 +131,53 @@ function enqueue(job) {
 }
 
 // =====================================================================
-//                          NLP (перевод/выжимка)
+//                          NEWS (GDELT + FULL ARTICLE + NLP)
 // =====================================================================
 
-const NLP_URL = String(process.env.NLP_URL || "").trim();              // например: http://138.124.69.96:8787/nlp
-const NLP_API_KEY = String(process.env.NLP_API_KEY || "").trim();      // ваш x-api-key
-const NLP_ENABLED = String(process.env.NLP_ENABLED || "1") === "1" && NLP_URL && NLP_API_KEY;
-const NLP_TIMEOUT_MS = Number(process.env.NLP_TIMEOUT_MS || 15000);
-
-// сколько новостей за один poll прогонять через NLP (чтобы не грузить VPS)
-const NEWS_AI_MAX_PER_RUN = Number(process.env.NEWS_AI_MAX_PER_RUN || 2);
-
-async function fetchTextWithTimeout(url, options = {}, timeoutMs = 15000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...options, signal: ctrl.signal });
-    const text = await res.text();
-    return { res, text };
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-async function nlpRu({ title, snippet }) {
-  if (!NLP_ENABLED) return null;
-
-  try {
-    const { res, text } = await fetchTextWithTimeout(
-      NLP_URL,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": NLP_API_KEY,
-        },
-        body: JSON.stringify({ title, snippet }),
-      },
-      NLP_TIMEOUT_MS
-    );
-
-    if (!res.ok) {
-      console.warn("[NEWS][NLP] HTTP", res.status, text.slice(0, 200));
-      return null;
-    }
-
-    try {
-      return JSON.parse(text); // {title_ru, summary_ru, tags}
-    } catch {
-      console.warn("[NEWS][NLP] non-JSON:", text.slice(0, 200));
-      return null;
-    }
-  } catch (e) {
-    console.warn("[NEWS][NLP] failed:", e?.message || e);
-    return null;
-  }
-}
-
-function buildPrettyNewsHtml({ title, titleRu, summaryRu, tags, domains, when, link }) {
-  const lines = [];
-
-  lines.push(`<b>🌍 Глобальные события</b>`);
-  lines.push(`<b>${escapeHtml(titleRu || title || "Без заголовка")}</b>`);
-
-  if (summaryRu) lines.push(`📝 ${escapeHtml(summaryRu)}`);
-
-  if (Array.isArray(tags) && tags.length) {
-    const tagLine = tags.slice(0, 3).map((t) => String(t || "").trim()).filter(Boolean).join(", ");
-    if (tagLine) lines.push(`🏷 ${escapeHtml(tagLine)}`);
-  }
-
-  if (domains) lines.push(`🗞 <i>${escapeHtml(domains)}</i>`);
-  if (when) lines.push(`⏱ <code>${escapeHtml(when)}</code>`);
-
-  if (link) lines.push(`🔗 <a href="${escapeAttr(link)}">Открыть источник</a>`);
-
-  return lines.join("\n");
-}
-
-// =====================================================================
-//                          GDELT NEWS INTEGRATION
-// =====================================================================
-
-// Включение/настройки
+// --- базовые настройки ---
 const NEWS_ENABLED = String(process.env.NEWS_ENABLED || "1") === "1";
-const NEWS_INTERVAL_MIN = Number(process.env.NEWS_INTERVAL_MIN || 10); // каждые 10 минут
-const NEWS_TIMESPAN = process.env.NEWS_TIMESPAN || "2h"; // окно поиска, например 1h/2h/6h
-const NEWS_MAX_PER_RUN = Number(process.env.NEWS_MAX_PER_RUN || 2); // максимум постов за запуск
-const NEWS_MIN_SOURCES = Number(process.env.NEWS_MIN_SOURCES || 3); // минимально уникальных доменов на событие
-const NEWS_MIN_SOURCES_HARD = Number(process.env.NEWS_MIN_SOURCES_HARD || 1); // для "тяжёлых" событий
+const NEWS_INTERVAL_MIN = Number(process.env.NEWS_INTERVAL_MIN || 10);
+const NEWS_TIMESPAN = String(process.env.NEWS_TIMESPAN || "24h").trim();
+const NEWS_MAX_PER_RUN = Number(process.env.NEWS_MAX_PER_RUN || 1);
+const NEWS_MIN_SOURCES = Number(process.env.NEWS_MIN_SOURCES || 1);
+const NEWS_MIN_SOURCES_HARD = Number(process.env.NEWS_MIN_SOURCES_HARD || 1);
+const NEWS_DISABLE_PREVIEW = String(process.env.NEWS_DISABLE_PREVIEW || "1") === "1";
 
-// можно: "english" или "english,russian"
-const NEWS_SOURCELANG_RAW = String(process.env.NEWS_SOURCELANG || "english").trim();
+// языки: "english,russian"
+const NEWS_SOURCELANG = String(process.env.NEWS_SOURCELANG || "").trim();
 
-// whitelist доменов (опционально). Пример: reuters.com,bbc.co.uk,apnews.com,aljazeera.com
+// домены whitelist (опционально): "reuters.com,bbc.co.uk"
 const NEWS_DOMAINS = (process.env.NEWS_DOMAINS || "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
 
-// отключать превью по умолчанию (карточки)
-const NEWS_DISABLE_PREVIEW = String(process.env.NEWS_DISABLE_PREVIEW || "1") === "1";
-
-// Ключ API для ручного триггера /news/poll (чтобы чужие не дергали)
+// ручной /news/poll защитить ключом (опционально)
 const NEWS_POLL_KEY = process.env.NEWS_POLL_KEY || "";
 
-// Где хранить дедуп (файл).
+// дедуп на диске (в рамках одного инстанса)
 const NEWS_STATE_FILE = path.join(process.cwd(), "gdelt_state.json");
+
+// анти-спам по запросам к GDELT (защита от 429)
+const GDELT_MIN_GAP_MS = Number(process.env.GDELT_MIN_GAP_MS || 5500);
+let lastGdeltRequestAt = 0;
+
+// --- вытаскивание полного текста статьи ---
+const NEWS_FETCH_FULL = String(process.env.NEWS_FETCH_FULL || "1") === "1";
+const NEWS_FULL_MAX_CHARS = Number(process.env.NEWS_FULL_MAX_CHARS || 9000);
+const NEWS_FETCH_TIMEOUT_MS = Number(process.env.NEWS_FETCH_TIMEOUT_MS || 15000);
+const NEWS_FETCH_MAX_BYTES = Number(process.env.NEWS_FETCH_MAX_BYTES || 900000);
+const NEWS_TEXT_MIN_CHARS = Number(process.env.NEWS_TEXT_MIN_CHARS || 400);
+
+// --- NLP (ваш news-nlp на VPS) ---
+const NLP_URL = String(process.env.NLP_URL || "").trim(); // например http://IP:8787/nlp
+const NLP_API_KEY = String(process.env.NLP_API_KEY || "").trim();
+const NEWS_AI_MAX_PER_RUN = Number(process.env.NEWS_AI_MAX_PER_RUN || 1);
+const NEWS_AI_ENABLED = String(process.env.NEWS_AI_ENABLED || "1") === "1";
+
+// --- запрос по умолчанию ---
+const DEFAULT_GDELT_QUERY = `(missile OR airstrike OR invasion OR sanctions OR coup OR emergency)`;
+const GDELT_QUERY = String(process.env.GDELT_QUERY || DEFAULT_GDELT_QUERY).replace(/\s+/g, " ").trim();
 
 function loadNewsState() {
   try {
@@ -238,7 +189,6 @@ function loadNewsState() {
     return { sent: {}, lastRunIso: null };
   }
 }
-
 function saveNewsState(state) {
   try {
     fs.writeFileSync(NEWS_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
@@ -246,24 +196,20 @@ function saveNewsState(state) {
     console.error("[NEWS] Failed to save state:", e?.message || e);
   }
 }
-
 function cleanupNewsState(state, ttlHours = 72) {
   const cutoff = Date.now() - ttlHours * 3600 * 1000;
-  const entries = Object.entries(state.sent || {});
-  for (const [k, ts] of entries) {
+  for (const [k, ts] of Object.entries(state.sent || {})) {
     if (!ts || ts < cutoff) delete state.sent[k];
   }
 }
 
-// “тяжёлые” события — можно постить даже при 1 источнике
 function isHardImpact(title) {
   const t = String(title || "").toLowerCase();
-  return /nuclear|radiological|missile|airstrike|air strike|chemical attack|coup|martial law|state of emergency|tsunami|earthquake|internet shutdown/.test(
+  return /nuclear|radiological|missile|airstrike|chemical attack|coup|martial law|state of emergency|tsunami|earthquake|internet shutdown|blackout/.test(
     t
   );
 }
 
-// Нормализация заголовка для грубого “кластера”
 function normalizeTitleToKey(title) {
   const stop = new Set([
     "the","a","an","and","or","to","of","in","on","for","with","as","at","by",
@@ -290,17 +236,33 @@ function pickDomain(article) {
   }
 }
 
-function formatSeenDateUTC(seendate) {
-  // Обычно seendate приходит как YYYYMMDDHHMMSS
-  const s = String(seendate || "");
-  if (!/^\d{14}$/.test(s)) return s || "unknown";
-  const yyyy = s.slice(0, 4);
-  const mm = s.slice(4, 6);
-  const dd = s.slice(6, 8);
-  const HH = s.slice(8, 10);
-  const MI = s.slice(10, 12);
-  const SS = s.slice(12, 14);
-  return `${yyyy}-${mm}-${dd} ${HH}:${MI}:${SS} UTC`;
+function pickOneDomain(domainsRaw) {
+  const d = String(domainsRaw || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return d[0] || "";
+}
+
+function guessRegion(title, summary) {
+  const t = `${title} ${summary}`.toLowerCase();
+  if (t.match(/украин|киев|kiev|ukrain|zelensk/)) return "Украина";
+  if (t.match(/росси|москв|russia|kremlin/)) return "Россия";
+  if (t.match(/израил|israel|gaza/)) return "Израиль";
+  if (t.match(/иран|iran/)) return "Иран";
+  if (t.match(/кита|china|beijing/)) return "Китай";
+  if (t.match(/сша|usa|u\.s\.|united states|washington/)) return "США";
+  if (t.match(/евросоюз|eu|european union|ес\b/)) return "ЕС";
+  return "Мир";
+}
+
+function guessCategory(title, summary) {
+  const t = `${title} ${summary}`.toLowerCase();
+  if (t.match(/missile|drone|strike|airstrike|invasion|attack|war|войн|удар|дрон|ракето|вторжен/)) return "⚔️ Конфликт";
+  if (t.match(/sanction|tariff|export control|санкц|пошлин|экспорт/)) return "💰 Экономика";
+  if (t.match(/earthquake|tsunami|volcan|flood|storm|землетр|цунами|изверж|ураган|пожар/)) return "💥 ЧП";
+  if (t.match(/election|parliament|minister|government|президент|министр|правительств|выбор|дипломат/)) return "🏛 Политика";
+  return "🌍 События";
 }
 
 async function fetchJsonWithTimeout(url, timeoutMs = 20000) {
@@ -309,60 +271,47 @@ async function fetchJsonWithTimeout(url, timeoutMs = 20000) {
 
   try {
     const res = await fetch(url, { signal: ctrl.signal });
-
-    // Важно: сначала читаем как текст
     const text = await res.text();
 
     if (!res.ok) {
-      throw new Error(`GDELT HTTP ${res.status}: ${text.slice(0, 200)}`);
+      throw new Error(`HTTP ${res.status}: ${text.slice(0, 250)}`);
     }
 
     try {
       return JSON.parse(text);
     } catch {
-      throw new Error(`GDELT returned non-JSON: ${text.slice(0, 200)}`);
+      throw new Error(`Non-JSON: ${text.slice(0, 250)}`);
     }
   } finally {
     clearTimeout(t);
   }
 }
 
-// Запрос по умолчанию (геополитика/кризисы)
-const DEFAULT_GDELT_QUERY = `(
-  "state of emergency" OR "martial law" OR coup OR "military takeover" OR
-  missile OR missiles OR "air strike" OR airstrike OR drone OR drones OR
-  nuclear OR radiological OR "chemical attack" OR
-  sanctions OR "export controls" OR blockade OR
-  "internet shutdown" OR "power outage" OR blackout OR
-  earthquake OR tsunami OR "volcanic eruption"
-)`;
-
-const GDELT_QUERY = (process.env.GDELT_QUERY || DEFAULT_GDELT_QUERY).replace(/\s+/g, " ").trim();
-
-function buildGdeltUrl() {
+function buildGdeltQueryFinal() {
   let q = GDELT_QUERY;
 
-  // --- sourcelang: поддержка "english,russian"
-  const langs = NEWS_SOURCELANG_RAW
-    .split(/[,\s]+/)
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
+  // языки: english,russian -> (sourcelang:english OR sourcelang:russian)
+  const langs = NEWS_SOURCELANG
+    ? NEWS_SOURCELANG.split(",").map((s) => s.trim()).filter(Boolean)
+    : [];
 
   if (langs.length === 1) {
-    q += ` sourcelang:${langs[0]}`;
+    q += ` AND sourcelang:${langs[0]}`;
   } else if (langs.length > 1) {
-    // скобки только если есть OR (иначе GDELT ругается)
-    q += ` (${langs.map((l) => `sourcelang:${l}`).join(" OR ")})`;
+    const block = langs.map((l) => `sourcelang:${l}`).join(" OR ");
+    q += ` AND (${block})`;
   }
 
-  // --- domains: скобки только если доменов > 1
-  if (NEWS_DOMAINS.length === 1) {
-    q += ` domainis:${NEWS_DOMAINS[0]}`;
-  } else if (NEWS_DOMAINS.length > 1) {
+  if (NEWS_DOMAINS.length) {
     const domBlock = NEWS_DOMAINS.map((d) => `domainis:${d}`).join(" OR ");
-    q += ` (${domBlock})`;
+    q += ` AND (${domBlock})`;
   }
 
+  return q.replace(/\s+/g, " ").trim();
+}
+
+function buildGdeltUrl() {
+  const q = buildGdeltQueryFinal();
   const params = new URLSearchParams({
     query: q,
     mode: "artlist",
@@ -371,7 +320,6 @@ function buildGdeltUrl() {
     maxrecords: "250",
     timespan: NEWS_TIMESPAN,
   });
-
   return `https://api.gdeltproject.org/api/v2/doc/doc?${params.toString()}`;
 }
 
@@ -410,7 +358,7 @@ function clusterArticles(articles) {
       hard: c.hard,
       domainCount: c.domains.size,
       top,
-      domains: Array.from(c.domains).filter(Boolean).slice(0, 6),
+      domains: Array.from(c.domains).filter(Boolean).slice(0, 8),
     });
   }
 
@@ -423,6 +371,152 @@ function clusterArticles(articles) {
   return out;
 }
 
+// --- скачивание HTML и извлечение текста статьи ---
+async function fetchHtml(url, timeoutMs, maxBytes) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": "Mozilla/5.0 (NewsBot/1.0)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ru,en;q=0.8",
+      },
+    });
+
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (!ct.includes("text/html")) {
+      throw new Error(`Not HTML: ${ct || "unknown"}`);
+    }
+
+    const ab = await res.arrayBuffer();
+    const buf = Buffer.from(ab);
+    const sliced = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
+    return sliced.toString("utf8");
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function extractArticleText(url) {
+  try {
+    const html = await fetchHtml(url, NEWS_FETCH_TIMEOUT_MS, NEWS_FETCH_MAX_BYTES);
+    const dom = new JSDOM(html, { url });
+
+    const reader = new Readability(dom.window.document);
+    const article = reader.parse();
+    if (!article || !article.textContent) return null;
+
+    const text = String(article.textContent)
+      .replace(/\s+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+
+    if (!text || text.length < NEWS_TEXT_MIN_CHARS) return null;
+
+    return {
+      title: article.title || "",
+      text: text.slice(0, NEWS_FULL_MAX_CHARS),
+    };
+  } catch (e) {
+    console.warn("[NEWS] extract failed:", e?.message || e);
+    return null;
+  }
+}
+
+// --- вызов вашего NLP ---
+async function callNlp({ title, snippet }) {
+  if (!NEWS_AI_ENABLED) return null;
+  if (!NLP_URL) return null;
+
+  const payload = {
+    title: String(title || "").slice(0, 400),
+    snippet: String(snippet || "").slice(0, 12000),
+  };
+
+  try {
+    const res = await fetch(NLP_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(NLP_API_KEY ? { "x-api-key": NLP_API_KEY } : {}),
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`NLP HTTP ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new Error(`NLP non-JSON: ${text.slice(0, 200)}`);
+    }
+  } catch (e) {
+    console.warn("[NEWS] nlp failed:", e?.message || e);
+    return null;
+  }
+}
+
+// --- красивое сообщение ---
+function normalizeSummaryToBullets(summaryRu) {
+  let s = String(summaryRu || "").trim();
+  if (!s) return "";
+
+  // если пришли "- " строки — превращаем в "• "
+  const lines = s.split("\n").map(l => l.trim()).filter(Boolean);
+  const out = lines.map(l => {
+    if (l.startsWith("- ")) return "• " + l.slice(2).trim();
+    if (l.startsWith("• ")) return l;
+    return l;
+  });
+
+  // если всё в одну строку — оставим как есть
+  return out.join("\n");
+}
+
+function buildPrettyNewsHtml({ title, titleRu, summaryRu, tags, domains, link }) {
+  const ruTitle = (titleRu || title || "Без заголовка").trim();
+  const summary = normalizeSummaryToBullets(summaryRu);
+
+  const region = guessRegion(ruTitle, summary);
+  const cat = guessCategory(ruTitle, summary);
+
+  const oneDomain = pickOneDomain(domains.join(", "));
+
+  // чтобы не упереться в лимит Telegram 4096 — режем разумно
+  const safeTitle = truncateText(ruTitle, 240);
+  const safeSummary = truncateText(summary, 2500);
+
+  let msg = "";
+  msg += `<b>${escapeHtml(cat)} • ${escapeHtml(region)}</b>\n`;
+  msg += `<b>${escapeHtml(safeTitle)}</b>\n`;
+
+  if (safeSummary) {
+    msg += `\n${escapeHtml(safeSummary)}\n`;
+  }
+
+  if (Array.isArray(tags) && tags.length) {
+    const tagLine = tags
+      .map((t) => String(t || "").trim())
+      .filter(Boolean)
+      .slice(0, 3)
+      .map((t) => "#" + t.replace(/\s+/g, "_"))
+      .join(" ");
+    if (tagLine) msg += `\n<i>${escapeHtml(tagLine)}</i>\n`;
+  }
+
+  if (oneDomain) msg += `\n🗞 <i>${escapeHtml(oneDomain)}</i>\n`;
+  if (link) msg += `🔗 <a href="${escapeAttr(link)}">Открыть источник</a>`;
+
+  return msg.trim();
+}
+
 let newsRunning = false;
 
 async function pollGdeltAndSend() {
@@ -430,6 +524,14 @@ async function pollGdeltAndSend() {
   newsRunning = true;
 
   try {
+    // защита от слишком частых запросов к GDELT (429)
+    const now = Date.now();
+    if (now - lastGdeltRequestAt < GDELT_MIN_GAP_MS) {
+      console.log("[NEWS] skip (cooldown)");
+      return;
+    }
+    lastGdeltRequestAt = now;
+
     const state = loadNewsState();
     cleanupNewsState(state, 72);
 
@@ -452,7 +554,8 @@ async function pollGdeltAndSend() {
       const min = c.hard ? NEWS_MIN_SOURCES_HARD : NEWS_MIN_SOURCES;
       if (c.domainCount < min) continue;
 
-      const dedupKey = `${c.key}::${c.top?.url || ""}`;
+      // дедуп по ключу кластера (а не по url), чтобы не спамило “одно и то же”
+      const dedupKey = `${c.key}`;
       if (state.sent[dedupKey]) continue;
 
       toSend.push({ ...c, dedupKey });
@@ -463,29 +566,37 @@ async function pollGdeltAndSend() {
 
     for (const item of toSend) {
       const a = item.top;
-
       const titleRaw = String(a?.title || "Untitled");
       const linkRaw = String(a?.url || "");
-      const whenRaw = formatSeenDateUTC(a?.seendate);
-      const domainsRaw = item.domains.join(", ") || pickDomain(a) || "source";
+      const domains = item.domains;
 
-      // Если у статьи есть описание/контекст — используйте его как snippet (если нет — пусть будет пусто)
+      // 1) пытаемся вытащить полный текст статьи
+      let articleText = "";
+      if (NEWS_FETCH_FULL && linkRaw) {
+        const extracted = await extractArticleText(linkRaw);
+        if (extracted?.text) articleText = extracted.text;
+      }
+
+      // fallback на короткое описание
       const snippetRaw =
         String(a?.description || a?.summary || a?.context || a?.snippet || "").trim();
 
+      const textForNlp = articleText || snippetRaw || titleRaw;
+
+      // 2) NLP (ограничиваем кол-во вызовов за один poll)
       let ai = null;
-      if (NLP_ENABLED && aiUsed < NEWS_AI_MAX_PER_RUN) {
-        ai = await nlpRu({ title: titleRaw, snippet: snippetRaw });
+      if (NEWS_AI_ENABLED && NLP_URL && aiUsed < NEWS_AI_MAX_PER_RUN) {
+        ai = await callNlp({ title: titleRaw, snippet: textForNlp });
         aiUsed++;
       }
 
+      // 3) формируем сообщение
       const msg = buildPrettyNewsHtml({
         title: titleRaw,
-        titleRu: ai?.title_ru,
-        summaryRu: ai?.summary_ru,
-        tags: ai?.tags,
-        domains: domainsRaw,
-        when: whenRaw,
+        titleRu: ai?.title_ru || "",
+        summaryRu: ai?.summary_ru || (snippetRaw ? truncateText(snippetRaw, 900) : ""),
+        tags: ai?.tags || [],
+        domains,
         link: linkRaw,
       });
 
@@ -493,11 +604,11 @@ async function pollGdeltAndSend() {
         threadId: TOPICS.news,
         message: msg,
         parseMode: "HTML",
-        disablePreview: NEWS_DISABLE_PREVIEW, // чтобы не было огромных карточек
+        disablePreview: NEWS_DISABLE_PREVIEW,
       });
 
       state.sent[item.dedupKey] = Date.now();
-      await sleep(250);
+      await sleep(400);
     }
 
     state.lastRunIso = new Date().toISOString();
@@ -517,7 +628,7 @@ function startNewsScheduler() {
   }
 
   console.log(
-    `[NEWS] scheduler enabled. interval=${NEWS_INTERVAL_MIN}m timespan=${NEWS_TIMESPAN} minSources=${NEWS_MIN_SOURCES}/${NEWS_MIN_SOURCES_HARD} ai=${NLP_ENABLED ? "on" : "off"} aiMax=${NEWS_AI_MAX_PER_RUN}`
+    `[NEWS] scheduler enabled. interval=${NEWS_INTERVAL_MIN}m timespan=${NEWS_TIMESPAN} minSources=${NEWS_MIN_SOURCES}/${NEWS_MIN_SOURCES_HARD} fetchFull=${NEWS_FETCH_FULL} ai=${NEWS_AI_ENABLED}`
   );
 
   // первый запуск сразу
@@ -529,17 +640,13 @@ function startNewsScheduler() {
   }, NEWS_INTERVAL_MIN * 60 * 1000);
 }
 
-// Ручной триггер. Защищаем ключом (если NEWS_POLL_KEY задан).
+// Ручной триггер. (Если NEWS_POLL_KEY пустой — доступ открыт, если задан — проверяем)
 app.post("/news/poll", (req, res) => {
   const key = req.headers["x-api-key"] || req.query.key || "";
-  if (NEWS_POLL_KEY && key !== NEWS_POLL_KEY) {
-    return res.status(403).send("Forbidden");
-  }
+  if (NEWS_POLL_KEY && key !== NEWS_POLL_KEY) return res.status(403).send("Forbidden");
   res.status(200).send("OK");
   pollGdeltAndSend().catch(() => {});
 });
-
-// =====================================================================
 
 // ---------- routes ----------
 app.get("/", (req, res) => res.send("Trading Alerts Bot is running!"));
@@ -565,9 +672,7 @@ app.post("/webhook/:tf", (req, res) => {
   enqueue({ threadId, message });
 });
 
-const PORT = process.env.PORT || 3000;
-
-// test
+// тест
 app.get("/news/test", (req, res) => {
   enqueue({
     threadId: TOPICS.news,
@@ -575,8 +680,8 @@ app.get("/news/test", (req, res) => {
   });
   res.send("OK");
 });
-// test
 
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   startNewsScheduler();

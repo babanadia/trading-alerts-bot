@@ -50,6 +50,11 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;");
 }
 
+function escapeAttr(str) {
+  // для href и подобных атрибутов
+  return escapeHtml(String(str || "")).replace(/"/g, "&quot;");
+}
+
 // ---------- Telegram send queue (важно для 429) ----------
 const queue = [];
 let processing = false;
@@ -115,6 +120,85 @@ function enqueue(job) {
 }
 
 // =====================================================================
+//                          NLP (перевод/выжимка)
+// =====================================================================
+
+const NLP_URL = String(process.env.NLP_URL || "").trim();              // например: http://138.124.69.96:8787/nlp
+const NLP_API_KEY = String(process.env.NLP_API_KEY || "").trim();      // ваш x-api-key
+const NLP_ENABLED = String(process.env.NLP_ENABLED || "1") === "1" && NLP_URL && NLP_API_KEY;
+const NLP_TIMEOUT_MS = Number(process.env.NLP_TIMEOUT_MS || 15000);
+
+// сколько новостей за один poll прогонять через NLP (чтобы не грузить VPS)
+const NEWS_AI_MAX_PER_RUN = Number(process.env.NEWS_AI_MAX_PER_RUN || 2);
+
+async function fetchTextWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: ctrl.signal });
+    const text = await res.text();
+    return { res, text };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function nlpRu({ title, snippet }) {
+  if (!NLP_ENABLED) return null;
+
+  try {
+    const { res, text } = await fetchTextWithTimeout(
+      NLP_URL,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": NLP_API_KEY,
+        },
+        body: JSON.stringify({ title, snippet }),
+      },
+      NLP_TIMEOUT_MS
+    );
+
+    if (!res.ok) {
+      console.warn("[NEWS][NLP] HTTP", res.status, text.slice(0, 200));
+      return null;
+    }
+
+    try {
+      return JSON.parse(text); // {title_ru, summary_ru, tags}
+    } catch {
+      console.warn("[NEWS][NLP] non-JSON:", text.slice(0, 200));
+      return null;
+    }
+  } catch (e) {
+    console.warn("[NEWS][NLP] failed:", e?.message || e);
+    return null;
+  }
+}
+
+function buildPrettyNewsHtml({ title, titleRu, summaryRu, tags, domains, when, link }) {
+  const lines = [];
+
+  lines.push(`<b>🌍 Глобальные события</b>`);
+  lines.push(`<b>${escapeHtml(titleRu || title || "Без заголовка")}</b>`);
+
+  if (summaryRu) lines.push(`📝 ${escapeHtml(summaryRu)}`);
+
+  if (Array.isArray(tags) && tags.length) {
+    const tagLine = tags.slice(0, 3).map((t) => String(t || "").trim()).filter(Boolean).join(", ");
+    if (tagLine) lines.push(`🏷 ${escapeHtml(tagLine)}`);
+  }
+
+  if (domains) lines.push(`🗞 <i>${escapeHtml(domains)}</i>`);
+  if (when) lines.push(`⏱ <code>${escapeHtml(when)}</code>`);
+
+  if (link) lines.push(`🔗 <a href="${escapeAttr(link)}">Открыть источник</a>`);
+
+  return lines.join("\n");
+}
+
+// =====================================================================
 //                          GDELT NEWS INTEGRATION
 // =====================================================================
 
@@ -125,7 +209,9 @@ const NEWS_TIMESPAN = process.env.NEWS_TIMESPAN || "2h"; // окно поиск�
 const NEWS_MAX_PER_RUN = Number(process.env.NEWS_MAX_PER_RUN || 2); // максимум постов за запуск
 const NEWS_MIN_SOURCES = Number(process.env.NEWS_MIN_SOURCES || 3); // минимально уникальных доменов на событие
 const NEWS_MIN_SOURCES_HARD = Number(process.env.NEWS_MIN_SOURCES_HARD || 1); // для "тяжёлых" событий
-const NEWS_SOURCELANG = (process.env.NEWS_SOURCELANG || "english").trim(); // english / russian / etc
+
+// можно: "english" или "english,russian"
+const NEWS_SOURCELANG_RAW = String(process.env.NEWS_SOURCELANG || "english").trim();
 
 // whitelist доменов (опционально). Пример: reuters.com,bbc.co.uk,apnews.com,aljazeera.com
 const NEWS_DOMAINS = (process.env.NEWS_DOMAINS || "")
@@ -133,11 +219,13 @@ const NEWS_DOMAINS = (process.env.NEWS_DOMAINS || "")
   .map((s) => s.trim())
   .filter(Boolean);
 
+// отключать превью по умолчанию (карточки)
+const NEWS_DISABLE_PREVIEW = String(process.env.NEWS_DISABLE_PREVIEW || "1") === "1";
+
 // Ключ API для ручного триггера /news/poll (чтобы чужие не дергали)
 const NEWS_POLL_KEY = process.env.NEWS_POLL_KEY || "";
 
-// Где хранить дедуп (файл). Для “чтобы не спамить” в рамках одного инстанса достаточно.
-// Если хотите переживать рестарты надежно — лучше Redis/SQLite, но это уже следующий шаг.
+// Где хранить дедуп (файл).
 const NEWS_STATE_FILE = path.join(process.cwd(), "gdelt_state.json");
 
 function loadNewsState() {
@@ -175,7 +263,7 @@ function isHardImpact(title) {
   );
 }
 
-// Нормализация заголовка для грубого “кластера” (чтобы 10 статей = 1 событие)
+// Нормализация заголовка для грубого “кластера”
 function normalizeTitleToKey(title) {
   const stop = new Set([
     "the","a","an","and","or","to","of","in","on","for","with","as","at","by",
@@ -225,23 +313,19 @@ async function fetchJsonWithTimeout(url, timeoutMs = 20000) {
     // Важно: сначала читаем как текст
     const text = await res.text();
 
-    // Если HTTP не 200 — показываем текст ошибки
     if (!res.ok) {
       throw new Error(`GDELT HTTP ${res.status}: ${text.slice(0, 200)}`);
     }
 
-    // Пробуем распарсить как JSON
     try {
       return JSON.parse(text);
     } catch {
-      // GDELT часто возвращает plain text ошибку вместо JSON
       throw new Error(`GDELT returned non-JSON: ${text.slice(0, 200)}`);
     }
   } finally {
     clearTimeout(t);
   }
 }
-
 
 // Запрос по умолчанию (геополитика/кризисы)
 const DEFAULT_GDELT_QUERY = `(
@@ -258,11 +342,23 @@ const GDELT_QUERY = (process.env.GDELT_QUERY || DEFAULT_GDELT_QUERY).replace(/\s
 function buildGdeltUrl() {
   let q = GDELT_QUERY;
 
-  if (NEWS_SOURCELANG) {
-    q += ` sourcelang:${NEWS_SOURCELANG}`;
+  // --- sourcelang: поддержка "english,russian"
+  const langs = NEWS_SOURCELANG_RAW
+    .split(/[,\s]+/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (langs.length === 1) {
+    q += ` sourcelang:${langs[0]}`;
+  } else if (langs.length > 1) {
+    // скобки только если есть OR (иначе GDELT ругается)
+    q += ` (${langs.map((l) => `sourcelang:${l}`).join(" OR ")})`;
   }
 
-  if (NEWS_DOMAINS.length) {
+  // --- domains: скобки только если доменов > 1
+  if (NEWS_DOMAINS.length === 1) {
+    q += ` domainis:${NEWS_DOMAINS[0]}`;
+  } else if (NEWS_DOMAINS.length > 1) {
     const domBlock = NEWS_DOMAINS.map((d) => `domainis:${d}`).join(" OR ");
     q += ` (${domBlock})`;
   }
@@ -339,7 +435,7 @@ async function pollGdeltAndSend() {
 
     const url = buildGdeltUrl();
     console.log("[NEWS] GDELT url:", url);
-    
+
     const json = await fetchJsonWithTimeout(url, 20000);
     const articles = Array.isArray(json?.articles) ? json.articles : [];
 
@@ -363,30 +459,45 @@ async function pollGdeltAndSend() {
       if (toSend.length >= NEWS_MAX_PER_RUN) break;
     }
 
+    let aiUsed = 0;
+
     for (const item of toSend) {
       const a = item.top;
 
-      const title = escapeHtml(a?.title || "Untitled");
-      const link = escapeHtml(a?.url || "");
-      const when = escapeHtml(formatSeenDateUTC(a?.seendate));
-      const domains = escapeHtml(item.domains.join(", ") || pickDomain(a) || "source");
+      const titleRaw = String(a?.title || "Untitled");
+      const linkRaw = String(a?.url || "");
+      const whenRaw = formatSeenDateUTC(a?.seendate);
+      const domainsRaw = item.domains.join(", ") || pickDomain(a) || "source";
 
-      const msg =
-        `<b>🌍 Global Alert</b>\n` +
-        `<b>${title}</b>\n` +
-        `<i>${domains}</i>\n` +
-        `<code>${when}</code>\n` +
-        (link ? `<a href="${link}">Open source</a>` : "");
+      // Если у статьи есть описание/контекст — используйте его как snippet (если нет — пусть будет пусто)
+      const snippetRaw =
+        String(a?.description || a?.summary || a?.context || a?.snippet || "").trim();
 
-      // ВАЖНО: отправляем в топик news
+      let ai = null;
+      if (NLP_ENABLED && aiUsed < NEWS_AI_MAX_PER_RUN) {
+        ai = await nlpRu({ title: titleRaw, snippet: snippetRaw });
+        aiUsed++;
+      }
+
+      const msg = buildPrettyNewsHtml({
+        title: titleRaw,
+        titleRu: ai?.title_ru,
+        summaryRu: ai?.summary_ru,
+        tags: ai?.tags,
+        domains: domainsRaw,
+        when: whenRaw,
+        link: linkRaw,
+      });
+
       enqueue({
         threadId: TOPICS.news,
         message: msg,
         parseMode: "HTML",
+        disablePreview: NEWS_DISABLE_PREVIEW, // чтобы не было огромных карточек
       });
 
       state.sent[item.dedupKey] = Date.now();
-      await sleep(250); // чуть разнести (очередь и так ограничит)
+      await sleep(250);
     }
 
     state.lastRunIso = new Date().toISOString();
@@ -406,7 +517,7 @@ function startNewsScheduler() {
   }
 
   console.log(
-    `[NEWS] scheduler enabled. interval=${NEWS_INTERVAL_MIN}m timespan=${NEWS_TIMESPAN} minSources=${NEWS_MIN_SOURCES}/${NEWS_MIN_SOURCES_HARD}`
+    `[NEWS] scheduler enabled. interval=${NEWS_INTERVAL_MIN}m timespan=${NEWS_TIMESPAN} minSources=${NEWS_MIN_SOURCES}/${NEWS_MIN_SOURCES_HARD} ai=${NLP_ENABLED ? "on" : "off"} aiMax=${NEWS_AI_MAX_PER_RUN}`
   );
 
   // первый запуск сразу
@@ -418,7 +529,7 @@ function startNewsScheduler() {
   }, NEWS_INTERVAL_MIN * 60 * 1000);
 }
 
-// Ручной триггер (удобно для Render Cron Job). Защищаем ключом.
+// Ручной триггер. Защищаем ключом (если NEWS_POLL_KEY задан).
 app.post("/news/poll", (req, res) => {
   const key = req.headers["x-api-key"] || req.query.key || "";
   if (NEWS_POLL_KEY && key !== NEWS_POLL_KEY) {
@@ -434,9 +545,7 @@ app.post("/news/poll", (req, res) => {
 app.get("/", (req, res) => res.send("Trading Alerts Bot is running!"));
 
 app.post("/webhook", (req, res) => {
-  // ВАЖНО: сразу отвечаем TradingView 200 OK (чтобы не терять алерты на таймауте)
   res.status(200).send("OK");
-
   const message = buildMessage(req.body);
   enqueue({ threadId: null, message });
 });
@@ -451,26 +560,24 @@ app.post("/webhook/:tf", (req, res) => {
       .send(`Unknown tf "${tf}". Allowed: ${Object.keys(TOPICS).join(", ")}`);
   }
 
-  // Сразу ack
   res.status(200).send("OK");
-
   const message = buildMessage(req.body);
   enqueue({ threadId, message });
 });
 
 const PORT = process.env.PORT || 3000;
 
-//test
+// test
 app.get("/news/test", (req, res) => {
   enqueue({
-    threadId: TOPICS.news, // 703
+    threadId: TOPICS.news,
     message: "🧪 TEST: бот пишет в топик NEWS",
   });
   res.send("OK");
 });
-//test
+// test
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  startNewsScheduler(); // запуск GDELT-новостей
+  startNewsScheduler();
 });

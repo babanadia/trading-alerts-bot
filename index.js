@@ -1,22 +1,15 @@
 const express = require("express");
 const TelegramBot = require("node-telegram-bot-api");
-const fs = require("fs");
-const path = require("path");
-
-// Для извлечения текста статьи:
-const { Readability } = require("@mozilla/readability");
 const { JSDOM } = require("jsdom");
+const { Readability } = require("@mozilla/readability");
 
 const app = express();
-
-// Принимаем всё как текст (TradingView часто шлёт plain text), JSON тоже поддержим
-app.use(express.text({ type: "*/*", limit: "2mb" }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.text({ type: "*/*", limit: "1mb" }));
+app.use(express.json({ limit: "1mb" }));
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN);
-const chatId = process.env.TELEGRAM_CHAT_ID; // "-100...."
+const chatId = process.env.TELEGRAM_CHAT_ID;
 
-// Темы (message_thread_id)
 const TOPICS = {
   "5m": 152,
   "15m": 525,
@@ -27,25 +20,8 @@ const TOPICS = {
   "news": 703,
 };
 
-// ---------- helpers ----------
-function buildMessage(body) {
-  if (typeof body === "string") {
-    const text = body.trim();
-    return `🚨 *Trading Alert*\n\n${text || "(empty body)"}`;
-  }
-
-  const data = body || {};
-  let msg = `🚨 *Trading Alert*\n\n`;
-  msg += `📊 *Ticker:* ${data.ticker || data.symbol || "N/A"}\n`;
-  msg += `💰 *Price:* ${data.price || data.close || "N/A"}\n`;
-  msg += `📝 *Action:* ${data.action || data.side || data.signal || "N/A"}\n`;
-  if (data.message) msg += `\n🔔 ${data.message}`;
-  return msg;
-}
-
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
+// ---------------- Telegram queue ----------------
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function escapeHtml(str) {
   return String(str || "")
@@ -53,61 +29,32 @@ function escapeHtml(str) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
-function escapeAttr(str) {
-  // для href=""
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/"/g, "&quot;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
 
-function truncateText(s, max) {
-  s = String(s || "");
-  if (s.length <= max) return s;
-  return s.slice(0, max - 1).trim() + "…";
-}
-
-// ---------- Telegram send queue (важно для 429) ----------
 const queue = [];
 let processing = false;
-
-// безопасная скорость: ~1 сообщение/сек в один чат
 const MIN_DELAY_MS = Number(process.env.TG_MIN_DELAY_MS || 1100);
 
 async function sendWithRetry(job, attempt = 1) {
-  const { threadId, message, parseMode, disablePreview } = job;
-
-  const options = { parse_mode: parseMode || "Markdown" };
-  if (disablePreview) options.disable_web_page_preview = true;
-  if (threadId) options.message_thread_id = threadId;
+  const options = { parse_mode: job.parseMode || "HTML" };
+  if (job.disablePreview) options.disable_web_page_preview = true;
+  if (job.threadId) options.message_thread_id = job.threadId;
 
   try {
-    await bot.sendMessage(chatId, message, options);
+    await bot.sendMessage(chatId, job.message, options);
   } catch (err) {
     const code = err?.response?.body?.error_code;
     const params = err?.response?.body?.parameters;
 
     if (code === 429 && params?.retry_after && attempt <= 5) {
-      const waitMs = params.retry_after * 1000 + 250;
-      console.warn(`TG 429. retry_after=${params.retry_after}s. attempt=${attempt}`);
-      await sleep(waitMs);
+      await sleep(params.retry_after * 1000 + 250);
       return sendWithRetry(job, attempt + 1);
     }
-
     const msg = String(err?.message || err);
-    const isTransient =
-      msg.includes("ETIMEDOUT") ||
-      msg.includes("ECONNRESET") ||
-      msg.includes("EAI_AGAIN") ||
-      msg.includes("socket hang up");
-
+    const isTransient = msg.includes("ETIMEDOUT") || msg.includes("ECONNRESET") || msg.includes("EAI_AGAIN") || msg.includes("socket hang up");
     if (isTransient && attempt <= 3) {
-      console.warn(`TG transient error. attempt=${attempt}. ${msg}`);
       await sleep(800 * attempt);
       return sendWithRetry(job, attempt + 1);
     }
-
     console.error("TG send failed:", err?.response?.body || msg);
   }
 }
@@ -115,217 +62,82 @@ async function sendWithRetry(job, attempt = 1) {
 async function processQueue() {
   if (processing) return;
   processing = true;
-
   while (queue.length) {
     const job = queue.shift();
     await sendWithRetry(job);
     await sleep(MIN_DELAY_MS);
   }
-
   processing = false;
 }
 
 function enqueue(job) {
   queue.push(job);
-  processQueue().catch((e) => console.error("Queue processing error:", e));
+  processQueue().catch(e => console.error("Queue processing error:", e));
 }
 
-// =====================================================================
-//                          NEWS (GDELT + FULL ARTICLE + NLP)
-// =====================================================================
+// ---------------- Alerts ----------------
+function buildMessage(body) {
+  if (typeof body === "string") {
+    const text = body.trim();
+    return `🚨 <b>Trading Alert</b>\n\n${escapeHtml(text || "(empty body)")}`;
+  }
+  const d = body || {};
+  let msg = `🚨 <b>Trading Alert</b>\n\n`;
+  msg += `📊 <b>Ticker:</b> ${escapeHtml(d.ticker || d.symbol || "N/A")}\n`;
+  msg += `💰 <b>Price:</b> ${escapeHtml(d.price || d.close || "N/A")}\n`;
+  msg += `📝 <b>Action:</b> ${escapeHtml(d.action || d.side || d.signal || "N/A")}\n`;
+  if (d.message) msg += `\n🔔 ${escapeHtml(d.message)}`;
+  return msg;
+}
 
-// --- базовые настройки ---
+// ---------------- News config ----------------
 const NEWS_ENABLED = String(process.env.NEWS_ENABLED || "1") === "1";
 const NEWS_INTERVAL_MIN = Number(process.env.NEWS_INTERVAL_MIN || 10);
-const NEWS_TIMESPAN = String(process.env.NEWS_TIMESPAN || "24h").trim();
-const NEWS_MAX_PER_RUN = Number(process.env.NEWS_MAX_PER_RUN || 1);
+const NEWS_TIMESPAN = process.env.NEWS_TIMESPAN || "24h";
+const NEWS_MAX_PER_RUN = Number(process.env.NEWS_MAX_PER_RUN || 3);
+const NEWS_AI_MAX_PER_RUN = Number(process.env.NEWS_AI_MAX_PER_RUN || NEWS_MAX_PER_RUN);
 const NEWS_MIN_SOURCES = Number(process.env.NEWS_MIN_SOURCES || 1);
-const NEWS_MIN_SOURCES_HARD = Number(process.env.NEWS_MIN_SOURCES_HARD || 1);
-const NEWS_DISABLE_PREVIEW = String(process.env.NEWS_DISABLE_PREVIEW || "1") === "1";
+const NEWS_DISABLE_PREVIEW = String(process.env.NEWS_DISABLE_PREVIEW || "0") === "1";
 
-// языки: "english,russian"
-const NEWS_SOURCELANG = String(process.env.NEWS_SOURCELANG || "").trim();
+const NEWS_DOMAINS = (process.env.NEWS_DOMAINS || "").split(",").map(s => s.trim()).filter(Boolean);
+const NEWS_SOURCELANG_LIST = (process.env.NEWS_SOURCELANG || "").split(",").map(s => s.trim()).filter(Boolean);
 
-// домены whitelist (опционально): "reuters.com,bbc.co.uk"
-const NEWS_DOMAINS = (process.env.NEWS_DOMAINS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+const GDELT_QUERY = (process.env.GDELT_QUERY || `(missile OR airstrike OR invasion OR sanctions OR coup OR emergency)`)
+  .replace(/\s+/g, " ").trim();
 
-// ручной /news/poll защитить ключом (опционально)
-const NEWS_POLL_KEY = process.env.NEWS_POLL_KEY || "";
+const NLP_URL = (process.env.NLP_URL || "").trim();
+const NLP_API_KEY = (process.env.NLP_API_KEY || "").trim();
 
-// дедуп на диске (в рамках одного инстанса)
-const NEWS_STATE_FILE = path.join(process.cwd(), "gdelt_state.json");
-
-// анти-спам по запросам к GDELT (защита от 429)
-const GDELT_MIN_GAP_MS = Number(process.env.GDELT_MIN_GAP_MS || 5500);
-let lastGdeltRequestAt = 0;
-
-// --- вытаскивание полного текста статьи ---
-const NEWS_FETCH_FULL = String(process.env.NEWS_FETCH_FULL || "1") === "1";
-const NEWS_FULL_MAX_CHARS = Number(process.env.NEWS_FULL_MAX_CHARS || 9000);
-const NEWS_FETCH_TIMEOUT_MS = Number(process.env.NEWS_FETCH_TIMEOUT_MS || 15000);
-const NEWS_FETCH_MAX_BYTES = Number(process.env.NEWS_FETCH_MAX_BYTES || 900000);
-const NEWS_TEXT_MIN_CHARS = Number(process.env.NEWS_TEXT_MIN_CHARS || 400);
-
-// --- NLP (ваш news-nlp на VPS) ---
-const NLP_URL = String(process.env.NLP_URL || "").trim(); // например http://IP:8787/nlp
-const NLP_API_KEY = String(process.env.NLP_API_KEY || "").trim();
-const NEWS_AI_MAX_PER_RUN = Number(process.env.NEWS_AI_MAX_PER_RUN || 1);
-const NEWS_AI_ENABLED = String(process.env.NEWS_AI_ENABLED || "1") === "1";
-
-// --- запрос по умолчанию ---
-const DEFAULT_GDELT_QUERY = `(missile OR airstrike OR invasion OR sanctions OR coup OR emergency)`;
-const GDELT_QUERY = String(process.env.GDELT_QUERY || DEFAULT_GDELT_QUERY).replace(/\s+/g, " ").trim();
-
-function loadNewsState() {
-  try {
-    const raw = fs.readFileSync(NEWS_STATE_FILE, "utf8");
-    const s = JSON.parse(raw);
-    if (!s.sent) s.sent = {};
-    return s;
-  } catch {
-    return { sent: {}, lastRunIso: null };
-  }
-}
-function saveNewsState(state) {
-  try {
-    fs.writeFileSync(NEWS_STATE_FILE, JSON.stringify(state, null, 2), "utf8");
-  } catch (e) {
-    console.error("[NEWS] Failed to save state:", e?.message || e);
-  }
-}
-function cleanupNewsState(state, ttlHours = 72) {
+// дедуп
+const sent = new Map();
+function cleanupSent(ttlHours = 48) {
   const cutoff = Date.now() - ttlHours * 3600 * 1000;
-  for (const [k, ts] of Object.entries(state.sent || {})) {
-    if (!ts || ts < cutoff) delete state.sent[k];
-  }
+  for (const [k, ts] of sent.entries()) if (ts < cutoff) sent.delete(k);
 }
 
-function isHardImpact(title) {
-  const t = String(title || "").toLowerCase();
-  return /nuclear|radiological|missile|airstrike|chemical attack|coup|martial law|state of emergency|tsunami|earthquake|internet shutdown|blackout/.test(
-    t
-  );
+// helpers
+function formatSeenDateUTC(seendate) {
+  const s = String(seendate || "");
+  if (!/^\d{14}$/.test(s)) return s || "unknown";
+  return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)} ${s.slice(8,10)}:${s.slice(10,12)}:${s.slice(12,14)} UTC`;
 }
-
+function pickDomain(a) {
+  if (a?.domain) return a.domain;
+  try { return new URL(a?.url).hostname; } catch { return ""; }
+}
 function normalizeTitleToKey(title) {
-  const stop = new Set([
-    "the","a","an","and","or","to","of","in","on","for","with","as","at","by",
-    "from","after","before","over","under","into","amid","says","say","said",
-    "update","live","breaking","report","reports"
-  ]);
-
+  const stop = new Set(["the","a","an","and","or","to","of","in","on","for","with","as","at","by","from","after","before","over","under","into","amid","says","say","said","update","live","breaking","report","reports"]);
   const tokens = String(title || "")
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, " ")
     .split(/\s+/)
-    .filter((w) => w.length >= 4 && !stop.has(w));
-
+    .filter(w => w.length >= 4 && !stop.has(w));
   tokens.sort();
   return tokens.slice(0, 12).join("_");
 }
 
-function pickDomain(article) {
-  if (article?.domain) return article.domain;
-  try {
-    return new URL(article?.url).hostname;
-  } catch {
-    return "";
-  }
-}
-
-function pickOneDomain(domainsRaw) {
-  const d = String(domainsRaw || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-  return d[0] || "";
-}
-
-function guessRegion(title, summary) {
-  const t = `${title} ${summary}`.toLowerCase();
-  if (t.match(/украин|киев|kiev|ukrain|zelensk/)) return "Украина";
-  if (t.match(/росси|москв|russia|kremlin/)) return "Россия";
-  if (t.match(/израил|israel|gaza/)) return "Израиль";
-  if (t.match(/иран|iran/)) return "Иран";
-  if (t.match(/кита|china|beijing/)) return "Китай";
-  if (t.match(/сша|usa|u\.s\.|united states|washington/)) return "США";
-  if (t.match(/евросоюз|eu|european union|ес\b/)) return "ЕС";
-  return "Мир";
-}
-
-function guessCategory(title, summary) {
-  const t = `${title} ${summary}`.toLowerCase();
-  if (t.match(/missile|drone|strike|airstrike|invasion|attack|war|войн|удар|дрон|ракето|вторжен/)) return "⚔️ Конфликт";
-  if (t.match(/sanction|tariff|export control|санкц|пошлин|экспорт/)) return "💰 Экономика";
-  if (t.match(/earthquake|tsunami|volcan|flood|storm|землетр|цунами|изверж|ураган|пожар/)) return "💥 ЧП";
-  if (t.match(/election|parliament|minister|government|президент|министр|правительств|выбор|дипломат/)) return "🏛 Политика";
-  return "🌍 События";
-}
-
-async function fetchJsonWithTimeout(url, timeoutMs = 20000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    const text = await res.text();
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}: ${text.slice(0, 250)}`);
-    }
-
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`Non-JSON: ${text.slice(0, 250)}`);
-    }
-  } finally {
-    clearTimeout(t);
-  }
-}
-
-function buildGdeltQueryFinal() {
-  let q = GDELT_QUERY;
-
-  // языки: english,russian -> (sourcelang:english OR sourcelang:russian)
-  const langs = NEWS_SOURCELANG
-    ? NEWS_SOURCELANG.split(",").map((s) => s.trim()).filter(Boolean)
-    : [];
-
-  if (langs.length === 1) {
-    q += ` AND sourcelang:${langs[0]}`;
-  } else if (langs.length > 1) {
-    const block = langs.map((l) => `sourcelang:${l}`).join(" OR ");
-    q += ` AND (${block})`;
-  }
-
-  if (NEWS_DOMAINS.length) {
-    const domBlock = NEWS_DOMAINS.map((d) => `domainis:${d}`).join(" OR ");
-    q += ` AND (${domBlock})`;
-  }
-
-  return q.replace(/\s+/g, " ").trim();
-}
-
-function buildGdeltUrl() {
-  const q = buildGdeltQueryFinal();
-  const params = new URLSearchParams({
-    query: q,
-    mode: "artlist",
-    format: "json",
-    sort: "datedesc",
-    maxrecords: "250",
-    timespan: NEWS_TIMESPAN,
-  });
-  return `https://api.gdeltproject.org/api/v2/doc/doc?${params.toString()}`;
-}
-
 function clusterArticles(articles) {
   const clusters = new Map();
-
   for (const a of articles) {
     const title = a?.title || "";
     const url = a?.url || "";
@@ -334,36 +146,24 @@ function clusterArticles(articles) {
     const key = normalizeTitleToKey(title);
     const dom = pickDomain(a);
 
-    if (!clusters.has(key)) {
-      clusters.set(key, {
-        key,
-        hard: isHardImpact(title),
-        domains: new Set(),
-        items: [],
-      });
-    }
-
+    if (!clusters.has(key)) clusters.set(key, { key, domains: new Set(), items: [] });
     const c = clusters.get(key);
     c.domains.add(dom);
     c.items.push(a);
-    if (isHardImpact(title)) c.hard = true;
   }
 
   const out = [];
   for (const c of clusters.values()) {
     c.items.sort((x, y) => String(y?.seendate || "").localeCompare(String(x?.seendate || "")));
-    const top = c.items[0];
     out.push({
       key: c.key,
-      hard: c.hard,
       domainCount: c.domains.size,
-      top,
-      domains: Array.from(c.domains).filter(Boolean).slice(0, 8),
+      top: c.items[0],
+      domains: Array.from(c.domains).filter(Boolean).slice(0, 10),
     });
   }
 
   out.sort((a, b) => {
-    if (a.hard !== b.hard) return a.hard ? -1 : 1;
     if (a.domainCount !== b.domainCount) return b.domainCount - a.domainCount;
     return String(b.top?.seendate || "").localeCompare(String(a.top?.seendate || ""));
   });
@@ -371,75 +171,124 @@ function clusterArticles(articles) {
   return out;
 }
 
-// --- скачивание HTML и извлечение текста статьи ---
-async function fetchHtml(url, timeoutMs, maxBytes) {
+function buildGdeltUrl() {
+  let q = GDELT_QUERY;
+
+  if (NEWS_SOURCELANG_LIST.length && !/sourcelang:/i.test(q)) {
+    const block = NEWS_SOURCELANG_LIST.map(l => `sourcelang:${l}`).join(" OR ");
+    q += ` (${block})`;
+  }
+
+  if (NEWS_DOMAINS.length && !/domainis:/i.test(q)) {
+    const domBlock = NEWS_DOMAINS.map(d => `domainis:${d}`).join(" OR ");
+    q += ` (${domBlock})`;
+  }
+
+  const params = new URLSearchParams({
+    query: q,
+    mode: "artlist",
+    format: "json",
+    sort: "datedesc",
+    maxrecords: "250",
+    timespan: NEWS_TIMESPAN,
+  });
+
+  return `https://api.gdeltproject.org/api/v2/doc/doc?${params.toString()}`;
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs = 20000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
-
   try {
-    const res = await fetch(url, {
-      signal: ctrl.signal,
-      redirect: "follow",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (NewsBot/1.0)",
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "ru,en;q=0.8",
-      },
-    });
-
-    const ct = (res.headers.get("content-type") || "").toLowerCase();
-    if (!ct.includes("text/html")) {
-      throw new Error(`Not HTML: ${ct || "unknown"}`);
-    }
-
-    const ab = await res.arrayBuffer();
-    const buf = Buffer.from(ab);
-    const sliced = buf.length > maxBytes ? buf.subarray(0, maxBytes) : buf;
-    return sliced.toString("utf8");
+    const res = await fetch(url, { signal: ctrl.signal });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`GDELT HTTP ${res.status}: ${text.slice(0, 200)}`);
+    try { return JSON.parse(text); } catch { throw new Error(`GDELT non-JSON: ${text.slice(0, 200)}`); }
   } finally {
     clearTimeout(t);
   }
 }
 
-async function extractArticleText(url) {
+// чтение статьи: Readability + fallback r.jina.ai
+const UA = process.env.NEWS_UA || "Mozilla/5.0 (NewsBot)";
+
+function clampText(s, max = 16000) {
+  s = String(s || "").replace(/\s+/g, " ").trim();
+  if (s.length <= max) return s;
+  return s.slice(0, max) + " …";
+}
+
+async function fetchArticleReadability(url, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const html = await fetchHtml(url, NEWS_FETCH_TIMEOUT_MS, NEWS_FETCH_MAX_BYTES);
+    const res = await fetch(url, {
+      signal: ctrl.signal,
+      redirect: "follow",
+      headers: { "User-Agent": UA, "Accept": "text/html,application/xhtml+xml,*/*" },
+    });
+    const html = await res.text();
     const dom = new JSDOM(html, { url });
 
-    const reader = new Readability(dom.window.document);
-    const article = reader.parse();
-    if (!article || !article.textContent) return null;
+    let parsed = null;
+    try { parsed = new Readability(dom.window.document).parse(); } catch {}
 
-    const text = String(article.textContent)
-      .replace(/\s+\n/g, "\n")
-      .replace(/\n{3,}/g, "\n\n")
-      .trim();
+    const title = parsed?.title || dom.window.document.title || "";
+    const text = clampText(parsed?.textContent || "", 16000);
+    const excerpt = clampText(parsed?.excerpt || "", 2000);
 
-    if (!text || text.length < NEWS_TEXT_MIN_CHARS) return null;
-
-    return {
-      title: article.title || "",
-      text: text.slice(0, NEWS_FULL_MAX_CHARS),
-    };
-  } catch (e) {
-    console.warn("[NEWS] extract failed:", e?.message || e);
-    return null;
+    return { title, text, excerpt };
+  } finally {
+    clearTimeout(t);
   }
 }
 
-// --- вызов вашего NLP ---
-async function callNlp({ title, snippet }) {
-  if (!NEWS_AI_ENABLED) return null;
+async function fetchArticleJina(url, timeoutMs = 20000) {
+  // r.jina.ai отдаёт текстовую “читабельную” версию страницы
+  const target = `https://r.jina.ai/${url}`;
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(target, {
+      signal: ctrl.signal,
+      headers: { "User-Agent": UA, "Accept": "text/plain,*/*" },
+    });
+    const text = await res.text();
+    return clampText(text, 16000);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function getArticle(url) {
+  const minChars = Number(process.env.NEWS_ARTICLE_MIN_CHARS || 800);
+
+  // 1) Readability
+  let a = { title: "", text: "", excerpt: "" };
+  try { a = await fetchArticleReadability(url, 20000); } catch {}
+
+  // 2) Если текста мало — fallback jina
+  if ((a.text || "").length < minChars) {
+    try {
+      const t = await fetchArticleJina(url, 20000);
+      if (t && t.length > (a.text || "").length) a.text = t;
+    } catch {}
+  }
+
+  return a;
+}
+
+// NLP call (timeout + лог ошибок)
+async function callNlp(payload) {
   if (!NLP_URL) return null;
 
-  const payload = {
-    title: String(title || "").slice(0, 400),
-    snippet: String(snippet || "").slice(0, 12000),
-  };
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 25000);
 
   try {
     const res = await fetch(NLP_URL, {
       method: "POST",
+      signal: ctrl.signal,
       headers: {
         "Content-Type": "application/json",
         ...(NLP_API_KEY ? { "x-api-key": NLP_API_KEY } : {}),
@@ -447,158 +296,117 @@ async function callNlp({ title, snippet }) {
       body: JSON.stringify(payload),
     });
 
-    const text = await res.text();
-    if (!res.ok) {
-      throw new Error(`NLP HTTP ${res.status}: ${text.slice(0, 200)}`);
-    }
+    const raw = await res.text();
+    if (!res.ok) throw new Error(`NLP HTTP ${res.status}: ${raw.slice(0, 200)}`);
 
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new Error(`NLP non-JSON: ${text.slice(0, 200)}`);
-    }
-  } catch (e) {
-    console.warn("[NEWS] nlp failed:", e?.message || e);
-    return null;
+    try { return JSON.parse(raw); }
+    catch { throw new Error(`NLP non-JSON: ${raw.slice(0, 200)}`); }
+  } finally {
+    clearTimeout(t);
   }
 }
 
-// --- красивое сообщение ---
-function normalizeSummaryToBullets(summaryRu) {
-  let s = String(summaryRu || "").trim();
-  if (!s) return "";
-
-  // если пришли "- " строки — превращаем в "• "
-  const lines = s.split("\n").map(l => l.trim()).filter(Boolean);
-  const out = lines.map(l => {
-    if (l.startsWith("- ")) return "• " + l.slice(2).trim();
-    if (l.startsWith("• ")) return l;
-    return l;
-  });
-
-  // если всё в одну строку — оставим как есть
-  return out.join("\n");
+function tagsToHashtags(tags) {
+  if (!Array.isArray(tags)) return "";
+  const cleaned = tags
+    .map(t => String(t || "").trim())
+    .filter(Boolean)
+    .slice(0, 8)
+    .map(t => "#" + t.replace(/\s+/g, "_").replace(/[^\p{L}\p{N}_]/gu, ""));
+  return cleaned.join(" ");
 }
 
-function buildPrettyNewsHtml({ title, titleRu, summaryRu, tags, domains, link }) {
-  const ruTitle = (titleRu || title || "Без заголовка").trim();
-  const summary = normalizeSummaryToBullets(summaryRu);
+function formatNewsMessage({ header, title, summary, tags, domains, when, link }) {
+  const h = escapeHtml(header || "События • Мир");
+  const t = escapeHtml(title || "Новость");
+  const s = escapeHtml(summary || "");
+  const d = escapeHtml(domains || "");
+  const w = escapeHtml(when || "");
+  const l = escapeHtml(link || "");
 
-  const region = guessRegion(ruTitle, summary);
-  const cat = guessCategory(ruTitle, summary);
-
-  const oneDomain = pickOneDomain(domains.join(", "));
-
-  // чтобы не упереться в лимит Telegram 4096 — режем разумно
-  const safeTitle = truncateText(ruTitle, 240);
-  const safeSummary = truncateText(summary, 2500);
-
-  let msg = "";
-  msg += `<b>${escapeHtml(cat)} • ${escapeHtml(region)}</b>\n`;
-  msg += `<b>${escapeHtml(safeTitle)}</b>\n`;
-
-  if (safeSummary) {
-    msg += `\n${escapeHtml(safeSummary)}\n`;
-  }
-
-  if (Array.isArray(tags) && tags.length) {
-    const tagLine = tags
-      .map((t) => String(t || "").trim())
-      .filter(Boolean)
-      .slice(0, 3)
-      .map((t) => "#" + t.replace(/\s+/g, "_"))
-      .join(" ");
-    if (tagLine) msg += `\n<i>${escapeHtml(tagLine)}</i>\n`;
-  }
-
-  if (oneDomain) msg += `\n🗞 <i>${escapeHtml(oneDomain)}</i>\n`;
-  if (link) msg += `🔗 <a href="${escapeAttr(link)}">Открыть источник</a>`;
-
-  return msg.trim();
+  let msg = `💥 <b>${h}</b>\n<b>${t}</b>\n\n`;
+  if (s) msg += `${s}\n\n`;
+  const ht = tagsToHashtags(tags);
+  if (ht) msg += `${escapeHtml(ht)}\n\n`;
+  msg += `📰 <i>${d}</i>\n`;
+  msg += `🕒 <code>${w}</code>\n`;
+  if (l) msg += `🔗 <a href="${l}">Открыть источник</a>`;
+  return msg;
 }
 
 let newsRunning = false;
+let lastGdeltFetch = 0;
 
 async function pollGdeltAndSend() {
   if (newsRunning) return;
   newsRunning = true;
 
   try {
-    // защита от слишком частых запросов к GDELT (429)
-    const now = Date.now();
-    if (now - lastGdeltRequestAt < GDELT_MIN_GAP_MS) {
-      console.log("[NEWS] skip (cooldown)");
-      return;
-    }
-    lastGdeltRequestAt = now;
+    cleanupSent(48);
 
-    const state = loadNewsState();
-    cleanupNewsState(state, 72);
+    // защита от слишком частых ручных вызовов (GDELT 429)
+    if (Date.now() - lastGdeltFetch < 6000) return;
+    lastGdeltFetch = Date.now();
 
     const url = buildGdeltUrl();
     console.log("[NEWS] GDELT url:", url);
 
     const json = await fetchJsonWithTimeout(url, 20000);
     const articles = Array.isArray(json?.articles) ? json.articles : [];
-
-    if (!articles.length) {
-      state.lastRunIso = new Date().toISOString();
-      saveNewsState(state);
-      return;
-    }
+    if (!articles.length) return;
 
     const clusters = clusterArticles(articles);
 
-    const toSend = [];
+    const chosen = [];
     for (const c of clusters) {
-      const min = c.hard ? NEWS_MIN_SOURCES_HARD : NEWS_MIN_SOURCES;
-      if (c.domainCount < min) continue;
+      if (c.domainCount < NEWS_MIN_SOURCES) continue;
+      const a = c.top;
+      const dedupKey = `${c.key}::${a?.url || ""}`;
+      if (sent.has(dedupKey)) continue;
 
-      // дедуп по ключу кластера (а не по url), чтобы не спамило “одно и то же”
-      const dedupKey = `${c.key}`;
-      if (state.sent[dedupKey]) continue;
-
-      toSend.push({ ...c, dedupKey });
-      if (toSend.length >= NEWS_MAX_PER_RUN) break;
+      chosen.push({ c, a, dedupKey });
+      if (chosen.length >= NEWS_MAX_PER_RUN) break;
     }
 
     let aiUsed = 0;
 
-    for (const item of toSend) {
-      const a = item.top;
-      const titleRaw = String(a?.title || "Untitled");
-      const linkRaw = String(a?.url || "");
-      const domains = item.domains;
+    for (const item of chosen) {
+      const a = item.a;
+      const link = a?.url || "";
+      const when = formatSeenDateUTC(a?.seendate);
+      const domains = item.c.domains.join(", ") || pickDomain(a) || "source";
 
-      // 1) пытаемся вытащить полный текст статьи
-      let articleText = "";
-      if (NEWS_FETCH_FULL && linkRaw) {
-        const extracted = await extractArticleText(linkRaw);
-        if (extracted?.text) articleText = extracted.text;
+      // По умолчанию: fallback формат (без AI)
+      let header = "События • Мир";
+      let title = a?.title || "News";
+      let summary = "";
+      let tags = [];
+
+      // AI: обрабатываем до NEWS_AI_MAX_PER_RUN
+      if (aiUsed < NEWS_AI_MAX_PER_RUN) {
+        try {
+          const article = link ? await getArticle(link) : { title: "", text: "", excerpt: "" };
+
+          const ai = await callNlp({
+            title: article.title || a?.title || "",
+            text: article.text || "",
+            snippet: article.excerpt || "",
+          });
+
+          if (ai) {
+            header = ai.header_ru || header;
+            title = ai.title_ru || title;
+            summary = ai.summary_ru || "";
+            tags = ai.tags || [];
+          }
+
+          aiUsed += 1;
+        } catch (e) {
+          console.warn("[NEWS] NLP failed:", e?.message || e);
+        }
       }
 
-      // fallback на короткое описание
-      const snippetRaw =
-        String(a?.description || a?.summary || a?.context || a?.snippet || "").trim();
-
-      const textForNlp = articleText || snippetRaw || titleRaw;
-
-      // 2) NLP (ограничиваем кол-во вызовов за один poll)
-      let ai = null;
-      if (NEWS_AI_ENABLED && NLP_URL && aiUsed < NEWS_AI_MAX_PER_RUN) {
-        ai = await callNlp({ title: titleRaw, snippet: textForNlp });
-        aiUsed++;
-      }
-
-      // 3) формируем сообщение
-      const msg = buildPrettyNewsHtml({
-        title: titleRaw,
-        titleRu: ai?.title_ru || "",
-        summaryRu: ai?.summary_ru || (snippetRaw ? truncateText(snippetRaw, 900) : ""),
-        tags: ai?.tags || [],
-        domains,
-        link: linkRaw,
-      });
+      const msg = formatNewsMessage({ header, title, summary, tags, domains, when, link });
 
       enqueue({
         threadId: TOPICS.news,
@@ -607,12 +415,9 @@ async function pollGdeltAndSend() {
         disablePreview: NEWS_DISABLE_PREVIEW,
       });
 
-      state.sent[item.dedupKey] = Date.now();
-      await sleep(400);
+      sent.set(item.dedupKey, Date.now());
+      await sleep(250);
     }
-
-    state.lastRunIso = new Date().toISOString();
-    saveNewsState(state);
   } catch (e) {
     console.error("[NEWS] poll error:", e?.message || e);
   } finally {
@@ -620,65 +425,40 @@ async function pollGdeltAndSend() {
   }
 }
 
-// Планировщик внутри сервиса
 function startNewsScheduler() {
   if (!NEWS_ENABLED) {
-    console.log("[NEWS] disabled (NEWS_ENABLED!=1)");
+    console.log("[NEWS] disabled");
     return;
   }
-
-  console.log(
-    `[NEWS] scheduler enabled. interval=${NEWS_INTERVAL_MIN}m timespan=${NEWS_TIMESPAN} minSources=${NEWS_MIN_SOURCES}/${NEWS_MIN_SOURCES_HARD} fetchFull=${NEWS_FETCH_FULL} ai=${NEWS_AI_ENABLED}`
-  );
-
-  // первый запуск сразу
+  console.log(`[NEWS] scheduler enabled. interval=${NEWS_INTERVAL_MIN}m timespan=${NEWS_TIMESPAN}`);
   pollGdeltAndSend().catch(() => {});
-
-  // затем по интервалу
-  setInterval(() => {
-    pollGdeltAndSend().catch(() => {});
-  }, NEWS_INTERVAL_MIN * 60 * 1000);
+  setInterval(() => pollGdeltAndSend().catch(() => {}), NEWS_INTERVAL_MIN * 60 * 1000);
 }
 
-// Ручной триггер. (Если NEWS_POLL_KEY пустой — доступ открыт, если задан — проверяем)
-app.post("/news/poll", (req, res) => {
-  const key = req.headers["x-api-key"] || req.query.key || "";
-  if (NEWS_POLL_KEY && key !== NEWS_POLL_KEY) return res.status(403).send("Forbidden");
-  res.status(200).send("OK");
-  pollGdeltAndSend().catch(() => {});
-});
-
-// ---------- routes ----------
+// ---------------- routes ----------------
 app.get("/", (req, res) => res.send("Trading Alerts Bot is running!"));
 
 app.post("/webhook", (req, res) => {
   res.status(200).send("OK");
-  const message = buildMessage(req.body);
-  enqueue({ threadId: null, message });
+  enqueue({ threadId: null, message: buildMessage(req.body), parseMode: "HTML" });
 });
 
 app.post("/webhook/:tf", (req, res) => {
   const tf = String(req.params.tf || "").toLowerCase();
   const threadId = TOPICS[tf];
-
-  if (!threadId) {
-    return res
-      .status(400)
-      .send(`Unknown tf "${tf}". Allowed: ${Object.keys(TOPICS).join(", ")}`);
-  }
-
+  if (!threadId) return res.status(400).send(`Unknown tf "${tf}". Allowed: ${Object.keys(TOPICS).join(", ")}`);
   res.status(200).send("OK");
-  const message = buildMessage(req.body);
-  enqueue({ threadId, message });
+  enqueue({ threadId, message: buildMessage(req.body), parseMode: "HTML" });
 });
 
-// тест
 app.get("/news/test", (req, res) => {
-  enqueue({
-    threadId: TOPICS.news,
-    message: "🧪 TEST: бот пишет в топик NEWS",
-  });
+  enqueue({ threadId: TOPICS.news, message: "🧪 TEST: бот пишет в топик NEWS", parseMode: "HTML" });
   res.send("OK");
+});
+
+app.post("/news/poll", (req, res) => {
+  res.status(200).send("OK");
+  pollGdeltAndSend().catch(() => {});
 });
 
 const PORT = process.env.PORT || 3000;

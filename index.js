@@ -61,6 +61,7 @@ async function sendWithRetry(job, attempt = 1) {
   const { threadId, message, parseMode } = job;
 
   const options = { parse_mode: parseMode || "Markdown" };
+  if (job.disablePreview) options.disable_web_page_preview = true;
   if (threadId) options.message_thread_id = threadId;
 
   try {
@@ -262,7 +263,7 @@ function buildGdeltUrl() {
   }
 
   if (NEWS_DOMAINS.length) {
-    const domBlock = NEWS_DOMAINS.map((d) => `domain:${d}`).join(" OR ");
+    const domBlock = NEWS_DOMAINS.map((d) => `domainis:${d}`).join(" OR ");
     q += ` (${domBlock})`;
   }
 

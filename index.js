@@ -18,6 +18,7 @@ const TOPICS = {
   "risk": 625,
   "fibo": 658,
   "btcvol": 684,
+  "news": 703,
 };
 
 // ---------- helpers ----------

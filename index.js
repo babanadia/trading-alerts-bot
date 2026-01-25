@@ -214,17 +214,33 @@ function formatSeenDateUTC(seendate) {
   return `${yyyy}-${mm}-${dd} ${HH}:${MI}:${SS} UTC`;
 }
 
-async function fetchJsonWithTimeout(url, timeoutMs = 15000) {
+async function fetchJsonWithTimeout(url, timeoutMs = 20000) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
+
   try {
     const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return await res.json();
+
+    // Важно: сначала читаем как текст
+    const text = await res.text();
+
+    // Если HTTP не 200 — показываем текст ошибки
+    if (!res.ok) {
+      throw new Error(`GDELT HTTP ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    // Пробуем распарсить как JSON
+    try {
+      return JSON.parse(text);
+    } catch {
+      // GDELT часто возвращает plain text ошибку вместо JSON
+      throw new Error(`GDELT returned non-JSON: ${text.slice(0, 200)}`);
+    }
   } finally {
     clearTimeout(t);
   }
 }
+
 
 // Запрос по умолчанию (геополитика/кризисы)
 const DEFAULT_GDELT_QUERY = `(
@@ -321,6 +337,8 @@ async function pollGdeltAndSend() {
     cleanupNewsState(state, 72);
 
     const url = buildGdeltUrl();
+    console.log("[NEWS] GDELT url:", url);
+    
     const json = await fetchJsonWithTimeout(url, 20000);
     const articles = Array.isArray(json?.articles) ? json.articles : [];
 

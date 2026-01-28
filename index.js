@@ -23,6 +23,7 @@ const TOPICS = {
   "fibo": 658,
   "btcvol": 684,
   "news": 703,
+  "ETF": 1241;
 };
 
 // ---------- helpers ----------

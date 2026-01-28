@@ -603,7 +603,10 @@ const ETF_TIMEZONE = envStr("ETF_TIMEZONE", "Europe/Warsaw");
 const ETF_HOUR = envInt("ETF_HOUR", 11);
 const ETF_MINUTE = envInt("ETF_MINUTE", 0);
 
+// лучше парсить All Data (стабильнее)
 const ETF_URL = "https://farside.co.uk/bitcoin-etf-flow-all-data/";
+
+// дедуп по последнему отправленному значению
 const ETF_STATE_FILE = path.join(process.cwd(), "etf_state.json");
 
 function loadEtfState() {
@@ -624,9 +627,8 @@ function saveEtfState(state) {
   }
 }
 
-// Возвращает { date, totalRaw, side } из html
 function parseLatestTotalFromFarsideHtml(html) {
-  // Упростим HTML -> текстовые токены
+  // HTML -> токены текста
   const text = String(html || "")
     .replace(/<script[\s\S]*?<\/script>/gi, "\n")
     .replace(/<style[\s\S]*?<\/style>/gi, "\n")
@@ -641,38 +643,31 @@ function parseLatestTotalFromFarsideHtml(html) {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  // Дата вида "09 Jan 2026"
   const dateRe = /^\d{2}\s+[A-Za-z]{3}\s+\d{4}$/;
 
-  // В таблице All Data после даты идёт 11 фондов + Total (12 значений)
+  // IBIT FBTC BITB ARKB BTCO EZBC BRRR HODL BTCW GBTC BTC Total
   const VALUES_AFTER_DATE = 12;
 
   let last = null;
 
   for (let i = 0; i < tokens.length; i++) {
     if (!dateRe.test(tokens[i])) continue;
-
     const date = tokens[i];
 
-    // соберём следующие 12 значений, допускаем "-", "(123.4)", "1,234.5"
     const vals = [];
     for (let j = i + 1; j < tokens.length && vals.length < VALUES_AFTER_DATE; j++) {
       const t = tokens[j];
-
       if (t === "-" || /^-?\(?[\d,]+(\.\d+)?\)?$/.test(t)) {
         vals.push(t);
       }
     }
 
     if (vals.length === VALUES_AFTER_DATE) {
-      const totalRaw = vals[VALUES_AFTER_DATE - 1];
-      last = { date, totalRaw };
+      last = { date, totalRaw: vals[VALUES_AFTER_DATE - 1] };
     }
   }
 
-  if (!last) {
-    throw new Error("Could not parse latest Total from Farside (layout changed?)");
-  }
+  if (!last) throw new Error("Could not parse latest Total from Farside (layout changed?)");
 
   const isDash = last.totalRaw === "-";
   const isSell = !isDash && /^\(.*\)$/.test(last.totalRaw);
@@ -684,6 +679,7 @@ function parseLatestTotalFromFarsideHtml(html) {
   };
 }
 
+// получаем текущее время в нужном TZ (без библиотек)
 function nowInTzParts(timeZone) {
   const dtf = new Intl.DateTimeFormat("en-CA", {
     timeZone,
@@ -699,9 +695,6 @@ function nowInTzParts(timeZone) {
   const get = (type) => parts.find((p) => p.type === type)?.value;
 
   return {
-    yyyy: get("year"),
-    mm: get("month"),
-    dd: get("day"),
     HH: Number(get("hour")),
     MI: Number(get("minute")),
     ymd: `${get("year")}-${get("month")}-${get("day")}`,
@@ -733,17 +726,16 @@ async function sendEtfDailyReport(force = false) {
 
   const data = parseLatestTotalFromFarsideHtml(html);
 
-  // Дедуп: ключ = date + totalRaw, чтобы не слать 2 раза одно и то же
   const dedupKey = `${data.date}|${data.totalRaw}`;
   if (!force && state.lastSentKey === dedupKey) {
-    console.log("[ETF] skip: already sent", dedupKey);
+    console.log("[ETF] skip already sent:", dedupKey);
     return;
   }
 
   const msg = formatEtfMessage(data);
 
   enqueue({
-    threadId: TOPICS.etf,   // 1241
+    threadId: TOPICS.etf, // 1241
     message: msg,
     parseMode: "HTML",
     disablePreview: true,
@@ -763,5 +755,74 @@ function startEtfScheduler() {
     return;
   }
   if (etfLoopStarted) return;
-  etfLoopStarted = got true;
+  etfLoopStarted = true;
+
+  console.log(
+    `[ETF] scheduler enabled at ${String(ETF_HOUR).padStart(2,"0")}:${String(ETF_MINUTE).padStart(2,"0")} TZ=${ETF_TIMEZONE}`
+  );
+
+  // Проверяем раз в 20 секунд — при совпадении времени отправим.
+  // Дедуп в etf_state.json не даст отправить 100 раз.
+  setInterval(() => {
+    try {
+      const t = nowInTzParts(ETF_TIMEZONE);
+      if (t.HH === ETF_HOUR && t.MI === ETF_MINUTE) {
+        sendEtfDailyReport(false).catch((e) =>
+          console.error("[ETF] send error:", e?.message || e)
+        );
+      }
+    } catch (e) {
+      console.error("[ETF] loop error:", e?.message || e);
+    }
+  }, 20000);
 }
+
+// ручной запуск (удобно для теста/крона)
+app.post("/etf/poll", (req, res) => {
+  res.status(200).send("OK");
+  sendEtfDailyReport(true).catch((e) =>
+    console.error("[ETF] manual poll error:", e?.message || e)
+  );
+});
+
+// тестовый пост в топик
+app.get("/etf/test", (req, res) => {
+  enqueue({
+    threadId: TOPICS.etf,
+    message: "<b>🧪 ETF TEST</b>\nБот пишет в топик ETF",
+    parseMode: "HTML",
+    disablePreview: true,
+  });
+  res.send("OK");
+});
+
+// -------------------- ROUTES --------------------
+app.get("/", (req, res) => res.send("Trading Alerts Bot is running!"));
+
+app.post("/webhook", (req, res) => {
+  res.status(200).send("OK");
+  const message = buildMessage(req.body);
+  enqueue({ threadId: null, message });
+});
+
+app.post("/webhook/:tf", (req, res) => {
+  const tf = String(req.params.tf || "").toLowerCase();
+  const threadId = TOPICS[tf];
+
+  if (!threadId) {
+    return res
+      .status(400)
+      .send(`Unknown tf "${tf}". Allowed: ${Object.keys(TOPICS).join(", ")}`);
+  }
+
+  res.status(200).send("OK");
+  const message = buildMessage(req.body);
+  enqueue({ threadId, message });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  startNewsScheduler();
+  startEtfScheduler();
+});

@@ -597,26 +597,25 @@ app.get("/news/test", (req, res) => {
   res.send("OK");
 });
 
-// -------------------- ETF (Farside Total) --------------------
+// -------------------- ETF FLOWS (BTC + ETH) --------------------
 const ETF_ENABLED = envBool("ETF_ENABLED", true);
 const ETF_TIMEZONE = envStr("ETF_TIMEZONE", "Europe/Warsaw");
 const ETF_HOUR = envInt("ETF_HOUR", 11);
 const ETF_MINUTE = envInt("ETF_MINUTE", 0);
 
-// лучше парсить All Data (стабильнее)
-const ETF_URL = "https://farside.co.uk/bitcoin-etf-flow-all-data/";
+const ETF_BTC_URL = "https://farside.co.uk/bitcoin-etf-flow-all-data/";
+const ETF_ETH_URL = "https://farside.co.uk/ethereum-etf-flow-all-data/";
 
-// дедуп по последнему отправленному значению
 const ETF_STATE_FILE = path.join(process.cwd(), "etf_state.json");
 
 function loadEtfState() {
   try {
     const raw = fs.readFileSync(ETF_STATE_FILE, "utf8");
     const s = JSON.parse(raw);
-    if (!s.lastSentKey) s.lastSentKey = "";
+    if (!s.lastSent) s.lastSent = {};
     return s;
   } catch {
-    return { lastSentKey: "" };
+    return { lastSent: {} };
   }
 }
 function saveEtfState(state) {
@@ -628,7 +627,6 @@ function saveEtfState(state) {
 }
 
 function parseLatestTotalFromFarsideHtml(html) {
-  // HTML -> токены текста
   const text = String(html || "")
     .replace(/<script[\s\S]*?<\/script>/gi, "\n")
     .replace(/<style[\s\S]*?<\/style>/gi, "\n")
@@ -645,25 +643,30 @@ function parseLatestTotalFromFarsideHtml(html) {
 
   const dateRe = /^\d{2}\s+[A-Za-z]{3}\s+\d{4}$/;
 
-  // IBIT FBTC BITB ARKB BTCO EZBC BRRR HODL BTCW GBTC BTC Total
-  const VALUES_AFTER_DATE = 12;
-
+  // В таблицах Farside: после даты идут колонки фондов и последняя — Total.
+  // Количество фондов отличается BTC/ETH, поэтому собираем значения до тех пор,
+  // пока не соберём хотя бы 2 и берём ПОСЛЕДНЕЕ как Total.
   let last = null;
 
   for (let i = 0; i < tokens.length; i++) {
     if (!dateRe.test(tokens[i])) continue;
+
     const date = tokens[i];
 
     const vals = [];
-    for (let j = i + 1; j < tokens.length && vals.length < VALUES_AFTER_DATE; j++) {
+    for (let j = i + 1; j < tokens.length; j++) {
       const t = tokens[j];
       if (t === "-" || /^-?\(?[\d,]+(\.\d+)?\)?$/.test(t)) {
         vals.push(t);
       }
+      // защита: если слишком много, значит уехали за строку
+      if (vals.length > 40) break;
+      // эвристика: если уже набрали достаточно и дальше началась следующая дата — стоп
+      if (j + 1 < tokens.length && dateRe.test(tokens[j + 1]) && vals.length >= 2) break;
     }
 
-    if (vals.length === VALUES_AFTER_DATE) {
-      last = { date, totalRaw: vals[VALUES_AFTER_DATE - 1] };
+    if (vals.length >= 2) {
+      last = { date, totalRaw: vals[vals.length - 1] }; // последнее значение в строке
     }
   }
 
@@ -679,7 +682,6 @@ function parseLatestTotalFromFarsideHtml(html) {
   };
 }
 
-// получаем текущее время в нужном TZ (без библиотек)
 function nowInTzParts(timeZone) {
   const dtf = new Intl.DateTimeFormat("en-CA", {
     timeZone,
@@ -701,38 +703,41 @@ function nowInTzParts(timeZone) {
   };
 }
 
-function formatEtfMessage({ date, totalRaw, side }) {
+function formatFlowMessage({ asset, date, totalRaw, side, sourceUrl }) {
   const emoji = side === "sell" ? "🔴" : side === "buy" ? "🟢" : "⚪️";
   const sideText =
-    side === "sell" ? "Продажи BTC" :
-    side === "buy" ? "Покупки BTC" :
+    side === "sell" ? "Продажи" :
+    side === "buy" ? "Покупки" :
     "Нет данных";
 
   return (
-    `<b>📊 BTC ETF Total</b>\n` +
+    `<b>📊 ${escapeHtml(asset)} ETF Total</b>\n` +
     `Дата: <code>${escapeHtml(date)}</code>\n` +
-    `${emoji} <b>${escapeHtml(sideText)}</b>\n` +
+    `${emoji} <b>${escapeHtml(sideText)} ${escapeHtml(asset)}</b>\n` +
     `Total: <b>${escapeHtml(totalRaw)}</b> (US$m)\n` +
-    `Источник: <a href="${escapeHtml(ETF_URL)}">farside.co.uk</a>`
+    `Источник: <a href="${escapeHtml(sourceUrl)}">farside.co.uk</a>`
   );
 }
 
-async function sendEtfDailyReport(force = false) {
+async function fetchAndSendFlow({ key, asset, url }, force = false) {
   const state = loadEtfState();
 
-  const html = await fetchText(ETF_URL, 25000, {
-    ua: "Mozilla/5.0 (ETFBot/1.0)",
-  });
-
+  const html = await fetchText(url, 25000, { ua: "Mozilla/5.0 (ETFBot/1.0)" });
   const data = parseLatestTotalFromFarsideHtml(html);
 
   const dedupKey = `${data.date}|${data.totalRaw}`;
-  if (!force && state.lastSentKey === dedupKey) {
-    console.log("[ETF] skip already sent:", dedupKey);
+  if (!force && state.lastSent[key] === dedupKey) {
+    console.log(`[ETF] skip already sent ${key}:`, dedupKey);
     return;
   }
 
-  const msg = formatEtfMessage(data);
+  const msg = formatFlowMessage({
+    asset,
+    date: data.date,
+    totalRaw: data.totalRaw,
+    side: data.side,
+    sourceUrl: url,
+  });
 
   enqueue({
     threadId: TOPICS.etf, // 1241
@@ -741,10 +746,26 @@ async function sendEtfDailyReport(force = false) {
     disablePreview: true,
   });
 
-  state.lastSentKey = dedupKey;
+  state.lastSent[key] = dedupKey;
   saveEtfState(state);
 
-  console.log("[ETF] sent:", dedupKey);
+  console.log(`[ETF] sent ${key}:`, dedupKey);
+}
+
+async function sendEtfDailyReport(force = false) {
+  // шлём два сообщения: BTC и ETH
+  await fetchAndSendFlow(
+    { key: "btc", asset: "BTC", url: ETF_BTC_URL },
+    force
+  );
+
+  // небольшая пауза чтобы не упереться в лимиты (очередь и так защитит, но пусть будет)
+  await sleep(300);
+
+  await fetchAndSendFlow(
+    { key: "eth", asset: "ETH", url: ETF_ETH_URL },
+    force
+  );
 }
 
 let etfLoopStarted = false;
@@ -758,11 +779,9 @@ function startEtfScheduler() {
   etfLoopStarted = true;
 
   console.log(
-    `[ETF] scheduler enabled at ${String(ETF_HOUR).padStart(2,"0")}:${String(ETF_MINUTE).padStart(2,"0")} TZ=${ETF_TIMEZONE}`
+    `[ETF] scheduler enabled at ${String(ETF_HOUR).padStart(2, "0")}:${String(ETF_MINUTE).padStart(2, "0")} TZ=${ETF_TIMEZONE}`
   );
 
-  // Проверяем раз в 20 секунд — при совпадении времени отправим.
-  // Дедуп в etf_state.json не даст отправить 100 раз.
   setInterval(() => {
     try {
       const t = nowInTzParts(ETF_TIMEZONE);

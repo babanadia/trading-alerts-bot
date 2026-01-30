@@ -627,50 +627,57 @@ function saveEtfState(state) {
 }
 
 function parseLatestTotalFromFarsideHtml(html) {
-  const text = String(html || "")
-    .replace(/<script[\s\S]*?<\/script>/gi, "\n")
-    .replace(/<style[\s\S]*?<\/style>/gi, "\n")
-    .replace(/<\/(td|th|tr|p|div|br|li|h\d)>/gi, "\n")
-    .replace(/<[^>]+>/g, "")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&");
+  const dom = new JSDOM(String(html || ""));
+  const doc = dom.window.document;
 
-  const tokens = text
-    .replace(/\u00a0/g, " ")
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .filter(Boolean);
-
+  // Дата вида "29 Jan 2026"
   const dateRe = /^\d{2}\s+[A-Za-z]{3}\s+\d{4}$/;
 
-  // В таблицах Farside: после даты идут колонки фондов и последняя — Total.
-  // Количество фондов отличается BTC/ETH, поэтому собираем значения до тех пор,
-  // пока не соберём хотя бы 2 и берём ПОСЛЕДНЕЕ как Total.
-  let last = null;
+  // Собираем кандидатов по всем таблицам и выберем ту, где больше всего "дат-строк"
+  const tables = Array.from(doc.querySelectorAll("table"));
+  if (!tables.length) throw new Error("No tables found on page");
 
-  for (let i = 0; i < tokens.length; i++) {
-    if (!dateRe.test(tokens[i])) continue;
+  function extractFromTable(tableEl) {
+    const rows = Array.from(tableEl.querySelectorAll("tr"));
+    const candidates = [];
 
-    const date = tokens[i];
+    for (const tr of rows) {
+      const cells = Array.from(tr.querySelectorAll("th,td"))
+        .map((c) => c.textContent.replace(/\u00a0/g, " ").trim());
 
-    const vals = [];
-    for (let j = i + 1; j < tokens.length; j++) {
-      const t = tokens[j];
-      if (t === "-" || /^-?\(?[\d,]+(\.\d+)?\)?$/.test(t)) {
-        vals.push(t);
-      }
-      // защита: если слишком много, значит уехали за строку
-      if (vals.length > 40) break;
-      // эвристика: если уже набрали достаточно и дальше началась следующая дата — стоп
-      if (j + 1 < tokens.length && dateRe.test(tokens[j + 1]) && vals.length >= 2) break;
+      if (cells.length < 2) continue;
+
+      const first = cells[0];
+      if (!dateRe.test(first)) continue;          // нужна именно строка с датой
+
+      // последняя колонка — Total (на Farside это правый край в этой таблице)
+      const totalRaw = cells[cells.length - 1];
+
+      // отсекаем пустое/мусор
+      if (!totalRaw) continue;
+      if (totalRaw.toLowerCase() === "total") continue;
+
+      // допускаем "-", "(123.4)", "1,234.5", "0.0"
+      if (!(totalRaw === "-" || /^-?\(?[\d,]+(\.\d+)?\)?$/.test(totalRaw))) continue;
+
+      candidates.push({ date: first, totalRaw });
     }
 
-    if (vals.length >= 2) {
-      last = { date, totalRaw: vals[vals.length - 1] }; // последнее значение в строке
-    }
+    return candidates;
   }
 
-  if (!last) throw new Error("Could not parse latest Total from Farside (layout changed?)");
+  let best = [];
+  for (const t of tables) {
+    const c = extractFromTable(t);
+    if (c.length > best.length) best = c;
+  }
+
+  if (!best.length) {
+    throw new Error("Could not find any date rows with Total column (layout changed?)");
+  }
+
+  // Берём последнюю опубликованную дату (последняя дата-строка в таблице)
+  const last = best[best.length - 1];
 
   const isDash = last.totalRaw === "-";
   const isSell = !isDash && /^\(.*\)$/.test(last.totalRaw);
@@ -681,6 +688,7 @@ function parseLatestTotalFromFarsideHtml(html) {
     side: isDash ? "no_data" : (isSell ? "sell" : "buy"),
   };
 }
+
 
 function nowInTzParts(timeZone) {
   const dtf = new Intl.DateTimeFormat("en-CA", {

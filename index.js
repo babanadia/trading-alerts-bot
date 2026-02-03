@@ -600,7 +600,7 @@ app.get("/news/test", (req, res) => {
 // -------------------- ETF FLOWS (BTC + ETH) --------------------
 const ETF_ENABLED = envBool("ETF_ENABLED", true);
 const ETF_TIMEZONE = envStr("ETF_TIMEZONE", "Europe/Warsaw");
-const ETF_HOUR = envInt("ETF_HOUR", 11);
+const ETF_HOUR = envInt("ETF_HOUR", 7);
 const ETF_MINUTE = envInt("ETF_MINUTE", 0);
 
 const ETF_BTC_URL = "https://farside.co.uk/bitcoin-etf-flow-all-data/";
